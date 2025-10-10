@@ -2,10 +2,12 @@
 # License: MIT. See LICENSE
 
 
+import json
 from contextlib import suppress
 from datetime import date, datetime, timedelta
 from math import ceil
 from typing import TYPE_CHECKING, TypedDict
+from urllib.parse import quote, urlparse
 from zoneinfo import ZoneInfo
 
 import google.oauth2.credentials
@@ -149,22 +151,52 @@ def authorize_access(g_calendar: str, reauthorize: bool = False):
 
 	google_settings = frappe.get_cached_doc("Google Settings")
 
-	# Get the site address and remove port for OAuth redirect URI
-	# Google OAuth requires redirect URIs without port numbers
-	site_url = get_request_site_address(full_address=True)
-	from urllib.parse import urlparse
-	parsed = urlparse(site_url)
-	# Reconstruct URL without port
-	base_url = f"{parsed.scheme}://{parsed.hostname}"
+	# Check if using central OAuth callback (for multi-tenant SaaS deployments)
+	use_central_callback = frappe.local.conf.get("oauth_central_callback_url")
 
-	redirect_uri = (
-		f"{base_url}"
-		f"?cmd={google_callback.__module__}.{google_callback.__qualname__}"
-	)
+	if use_central_callback:
+		# Multi-tenant mode: Use central callback URL with state parameter
+		# Get current tenant site hostname
+		host_name = frappe.local.conf.host_name or frappe.local.conf.hostname
+		if not host_name:
+			host_name = get_request_site_address(full_address=False)
+
+		# Extract just the hostname (remove protocol and port)
+		if host_name.startswith("http://") or host_name.startswith("https://"):
+			parsed = urlparse(host_name)
+			tenant_site = parsed.hostname
+		else:
+			tenant_site = host_name.split(":")[0]
+
+		# Encode tenant information in state parameter
+		state_data = {
+			"tenant_site": tenant_site,
+			"google_calendar": google_calendar.name
+		}
+		state = json.dumps(state_data)
+		redirect_uri = use_central_callback
+	else:
+		# Single-tenant mode: Direct callback to tenant site
+		# Get the site address and remove port for OAuth redirect URI
+		# Google OAuth requires redirect URIs without port numbers
+		site_url = get_request_site_address(full_address=True)
+		parsed = urlparse(site_url)
+		# Reconstruct URL without port
+		base_url = f"{parsed.scheme}://{parsed.hostname}"
+
+		redirect_uri = (
+			f"{base_url}"
+			f"?cmd={google_callback.__module__}.{google_callback.__qualname__}"
+		)
+		state = None
 
 	if not google_calendar.authorization_code or reauthorize:
 		frappe.cache.hset("google_calendar", "google_calendar", google_calendar.name)
-		return get_authentication_url(client_id=google_settings.client_id, redirect_uri=redirect_uri)
+		return get_authentication_url(
+			client_id=google_settings.client_id,
+			redirect_uri=redirect_uri,
+			state=state
+		)
 
 	data = {
 		"code": google_calendar.get_password(fieldname="authorization_code", raise_exception=False),
@@ -189,25 +221,35 @@ def authorize_access(g_calendar: str, reauthorize: bool = False):
 	frappe.msgprint(_("Google Calendar has been configured."), indicator="green")
 
 
-def get_authentication_url(client_id=None, redirect_uri=None):
-	from urllib.parse import quote
+def get_authentication_url(client_id=None, redirect_uri=None, state=None):
+	url = (
+		"https://accounts.google.com/o/oauth2/v2/auth?"
+		f"access_type=offline&response_type=code&prompt=consent&client_id={client_id}"
+		f"&include_granted_scopes=true&scope={SCOPES}&redirect_uri={quote(redirect_uri, safe='')}"
+	)
 
-	return {
-		"url": (
-			"https://accounts.google.com/o/oauth2/v2/auth?"
-			f"access_type=offline&response_type=code&prompt=consent&client_id={client_id}"
-			f"&include_granted_scopes=true&scope={SCOPES}&redirect_uri={quote(redirect_uri, safe='')}"
-		)
-	}
+	# Add state parameter for multi-tenant callback routing
+	if state:
+		url += f"&state={quote(state, safe='')}"
+
+	return {"url": url}
 
 
 @frappe.whitelist(allow_guest=True)
-def google_callback(code=None):
+def google_callback(code=None, google_calendar=None):
 	"""
 	Authorization code is sent to callback as per the API configuration.
+	Can be called directly (single-tenant) or via central OAuth handler (multi-tenant).
+
 	OAuth callbacks need allow_guest=True since user is not authenticated during redirect.
+
+	Args:
+		code: Authorization code from Google
+		google_calendar: Google Calendar name (from central handler or cache)
 	"""
-	google_calendar = frappe.cache.hget("google_calendar", "google_calendar")
+	# If google_calendar not provided, get from cache (original single-tenant behavior)
+	if not google_calendar:
+		google_calendar = frappe.cache.hget("google_calendar", "google_calendar")
 
 	if not google_calendar:
 		frappe.respond_as_web_page(
