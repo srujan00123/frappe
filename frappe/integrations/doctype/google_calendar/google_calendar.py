@@ -149,8 +149,16 @@ def authorize_access(g_calendar: str, reauthorize: bool = False):
 
 	google_settings = frappe.get_cached_doc("Google Settings")
 
+	# Get the site address and remove port for OAuth redirect URI
+	# Google OAuth requires redirect URIs without port numbers
+	site_url = get_request_site_address(full_address=True)
+	from urllib.parse import urlparse
+	parsed = urlparse(site_url)
+	# Reconstruct URL without port
+	base_url = f"{parsed.scheme}://{parsed.hostname}"
+
 	redirect_uri = (
-		f"{get_request_site_address(full_address=True)}"
+		f"{base_url}"
 		f"?cmd={google_callback.__module__}.{google_callback.__qualname__}"
 	)
 
@@ -182,21 +190,34 @@ def authorize_access(g_calendar: str, reauthorize: bool = False):
 
 
 def get_authentication_url(client_id=None, redirect_uri=None):
+	from urllib.parse import quote
+
 	return {
 		"url": (
 			"https://accounts.google.com/o/oauth2/v2/auth?"
 			f"access_type=offline&response_type=code&prompt=consent&client_id={client_id}"
-			f"&include_granted_scopes=true&scope={SCOPES}&redirect_uri={redirect_uri}"
+			f"&include_granted_scopes=true&scope={SCOPES}&redirect_uri={quote(redirect_uri, safe='')}"
 		)
 	}
 
 
-@frappe.whitelist()
+@frappe.whitelist(allow_guest=True)
 def google_callback(code=None):
 	"""
-	Authorization code is sent to callback as per the API configuration
+	Authorization code is sent to callback as per the API configuration.
+	OAuth callbacks need allow_guest=True since user is not authenticated during redirect.
 	"""
 	google_calendar = frappe.cache.hget("google_calendar", "google_calendar")
+
+	if not google_calendar:
+		frappe.respond_as_web_page(
+			_("Invalid Request"),
+			_("Google Calendar authorization session expired. Please try again."),
+			indicator_color="red",
+			http_status_code=400
+		)
+		return
+
 	frappe.db.set_value("Google Calendar", google_calendar, "authorization_code", code)
 	frappe.db.commit()
 
